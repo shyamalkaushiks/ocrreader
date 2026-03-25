@@ -1,0 +1,25 @@
+.env
+output/
+*.xlsx
+.DS_Store
+
+# OCR / extraction outputs (never commit)
+spatial_output_*/
+spatial_output*/
+opencv_grid_output*/
+paddleocr_output*/
+aws_output*/
+aws_output_test*/
+output_*/
+
+# Input / enhancement assets used for testing
+enhanced_images/
+enhanced_strong/
+WhatsApp-all-images/
+Image 24th march/
+
+# Local binaries / misc
+excelproject
+
+# Secrets / local env files
+.env.local
