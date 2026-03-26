@@ -200,32 +200,82 @@ def extract_table_from_image(engine, image_path: str) -> TableExtractionResult:
 
 def _run_ocr(engine, img: np.ndarray) -> List[_Box]:
     """Runs PaddleOCR and returns a flat list of _Box objects."""
+    # Fast path: preserve original local behaviour.
+    # If `cls` is supported, use the original parsing shape (`result[0]`).
     try:
-        result = engine.ocr(img, cls=True)
+        result_try = engine.ocr(img, cls=True)
+    except TypeError:
+        result_try = None
     except Exception:
         return []
 
-    if not result or not result[0]:
+    if isinstance(result_try, list) and result_try and result_try[0]:
+        boxes: List[_Box] = []
+        for item in result_try[0]:
+            if not item or len(item) < 2:
+                continue
+            try:
+                quad = item[0]
+                tc = item[1]
+                text = tc[0] if isinstance(tc, (list, tuple)) else str(tc)
+                text = text.strip()
+                if not text:
+                    continue
+                xs = [float(pt[0]) for pt in quad]
+                ys = [float(pt[1]) for pt in quad]
+                boxes.append(_Box(min(xs), min(ys), max(xs), max(ys), text))
+            except (IndexError, TypeError, ValueError):
+                continue
+        if boxes:
+            return boxes
+
+    # Fallback: PaddleOCR API differs by version. Some versions don't accept `cls`
+    # in `ocr()`; use safer argument sets and normalize output.
+    result: object = None
+    ocr_variants: Tuple[Dict[str, bool], ...] = (
+        {},
+        {"det": True, "rec": True},
+    )
+    for ocr_kwargs in ocr_variants:
+        try:
+            result = engine.ocr(img, **ocr_kwargs)
+            break
+        except TypeError:
+            continue
+        except Exception:
+            return []
+
+    if not result:
         return []
 
-    boxes: List[_Box] = []
-    for item in result[0]:
+    items: List[object] = []
+    if isinstance(result, list) and result:
+        if isinstance(result[0], list):
+            items = result[0] if result[0] is not None else []
+        else:
+            items = result
+
+    if not items:
+        return []
+
+    boxes_fallback: List[_Box] = []
+    for item in items:
         if not item or len(item) < 2:
             continue
         try:
-            quad    = item[0]          # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
-            tc      = item[1]          # (text, confidence)
-            text    = tc[0] if isinstance(tc, (list, tuple)) else str(tc)
-            text    = text.strip()
+            quad = item[0]
+            tc = item[1]
+            text = tc[0] if isinstance(tc, (list, tuple)) and tc else str(tc)
+            text = text.strip()
             if not text:
                 continue
             xs = [float(pt[0]) for pt in quad]
             ys = [float(pt[1]) for pt in quad]
-            boxes.append(_Box(min(xs), min(ys), max(xs), max(ys), text))
+            boxes_fallback.append(_Box(min(xs), min(ys), max(xs), max(ys), text))
         except (IndexError, TypeError, ValueError):
             continue
 
-    return boxes
+    return boxes_fallback
 
 
 # ── step 2: Y-cluster into rows ────────────────────────────────────────────
