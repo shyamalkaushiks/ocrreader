@@ -29,6 +29,8 @@ import time
 from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from excel_writer import write_single_workbook, write_workbooks_by_column_count
 from models import ImageTable, TableExtractionResult
 from spatial_engine import extract_table_from_image, initialize_ocr
@@ -44,6 +46,14 @@ def parse_arguments() -> argparse.Namespace:
     )
     p.add_argument("--input",  "-i", default="../enhanced_images",
                    help="Input folder with images (default: ../enhanced_images)")
+    p.add_argument("--s3-bucket", default="",
+                   help="S3 bucket name to fetch images from (overrides --input)")
+    p.add_argument("--s3-prefix", default="",
+                   help="S3 key prefix for image objects")
+    p.add_argument("--s3-region", default="",
+                   help="AWS region for S3 client (optional)")
+    p.add_argument("--s3-profile", default="",
+                   help="AWS profile name to use (optional)")
     p.add_argument("--output", "-o", default="../spatial_output",
                    help="Output folder for xlsx files (default: ../spatial_output)")
     p.add_argument("--limit",  "-l", type=int, default=0,
@@ -84,6 +94,98 @@ def list_image_files(input_dir: str, offset: int, limit: int) -> List[str]:
         files = files[:limit]
         print(f"limit: processing {len(files)} image(s)", file=sys.stderr)
     return files
+
+
+def _create_s3_client(args: argparse.Namespace):
+    session_kwargs: Dict[str, str] = {}
+    if args.s3_profile:
+        session_kwargs["profile_name"] = args.s3_profile
+    session = boto3.Session(**session_kwargs)
+    client_kwargs: Dict[str, str] = {}
+    if args.s3_region:
+        client_kwargs["region_name"] = args.s3_region
+    return session.client("s3", **client_kwargs)
+
+
+def _list_s3_image_keys(
+    s3_client,
+    bucket_name: str,
+    prefix: str,
+    offset: int,
+    limit: int,
+) -> List[str]:
+    paginator = s3_client.get_paginator("list_objects_v2")
+    page_iterator = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+    keys: List[str] = []
+    for page in page_iterator:
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            extension = os.path.splitext(key)[1].lower()
+            if extension in IMAGE_EXTENSIONS:
+                keys.append(key)
+    keys.sort()
+    if offset > 0:
+        keys = keys[offset:]
+        print(f"offset: skipped {offset} image(s), remaining {len(keys)}", file=sys.stderr)
+    if limit > 0:
+        keys = keys[:limit]
+        print(f"limit: processing {len(keys)} image(s)", file=sys.stderr)
+    if not keys:
+        print(
+            f"No images found in s3://{bucket_name}/{prefix}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return keys
+
+
+def _download_s3_images(
+    s3_client,
+    bucket_name: str,
+    object_keys: List[str],
+    destination_dir: str,
+) -> List[str]:
+    os.makedirs(destination_dir, exist_ok=True)
+    local_paths: List[str] = []
+    for object_key in object_keys:
+        local_filename = os.path.basename(object_key)
+        if not local_filename:
+            continue
+        local_path = os.path.join(destination_dir, local_filename)
+        s3_client.download_file(bucket_name, object_key, local_path)
+        local_paths.append(local_path)
+    if not local_paths:
+        print(
+            f"No valid image objects downloaded from s3://{bucket_name}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return sorted(local_paths)
+
+
+def resolve_input_files(args: argparse.Namespace) -> Tuple[List[str], str]:
+    if not args.s3_bucket:
+        return list_image_files(args.input, args.offset, args.limit), args.input
+    try:
+        s3_client = _create_s3_client(args)
+        keys = _list_s3_image_keys(
+            s3_client=s3_client,
+            bucket_name=args.s3_bucket,
+            prefix=args.s3_prefix,
+            offset=args.offset,
+            limit=args.limit,
+        )
+        cache_dir = os.path.join(args.output, "_s3_input_cache")
+        local_paths = _download_s3_images(
+            s3_client=s3_client,
+            bucket_name=args.s3_bucket,
+            object_keys=keys,
+            destination_dir=cache_dir,
+        )
+        return local_paths, f"s3://{args.s3_bucket}/{args.s3_prefix}"
+    except (BotoCoreError, ClientError) as err:
+        print(f"Failed to fetch S3 input: {err}", file=sys.stderr)
+        sys.exit(1)
 
 
 def save_debug_json(debug_dir: str, image_path: str, result: TableExtractionResult) -> None:
@@ -190,11 +292,9 @@ def print_summary(
 
 def main() -> None:
     args = parse_arguments()
-
-    files = list_image_files(args.input, args.offset, args.limit)
-    total = len(files)
-
     os.makedirs(args.output, exist_ok=True)
+    files, input_source = resolve_input_files(args)
+    total = len(files)
 
     debug_dir = ""
     if args.save_json:
@@ -204,7 +304,7 @@ def main() -> None:
     print("\nInitialising PaddleOCR (spatial mode — no PP-Structure)...")
     engine = initialize_ocr()
     print(f"Engine ready. Processing {total} images...\n")
-    print(f"   Input:  {args.input}")
+    print(f"   Input:  {input_source}")
     print(f"   Output: {args.output}\n")
 
     by_cols: Dict[int, List[ImageTable]] = {}
